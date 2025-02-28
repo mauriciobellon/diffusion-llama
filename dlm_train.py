@@ -144,6 +144,8 @@ def main():
     lr = 1e-4
     num_epochs = 1  # Reduced from 3 to 1
     batch_size = 2  # Reduced from 4 to 2
+    gradient_accumulation_steps = 4  # Accumulate gradients over multiple batches
+    max_grad_norm = 1.0  # For gradient clipping
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -164,16 +166,38 @@ def main():
         if os.path.exists(cache_model_path):
             print(f"Found cached model at {cache_model_path}, loading from there")
             tokenizer = AutoTokenizer.from_pretrained(cache_model_path)
-            llama_model = AutoModelForCausalLM.from_pretrained(cache_model_path)
+            llama_model = AutoModelForCausalLM.from_pretrained(
+                cache_model_path,
+                device_map="auto",
+                torch_dtype=torch.float16,  # Use FP16 precision
+                use_cache=False,  # Disable KV cache for training
+            )
         else:
             print(f"Downloading model from HuggingFace: {model_path}")
             tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
-            llama_model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+            llama_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                cache_dir=PROJECTS_DIR,
+                device_map="auto",
+                torch_dtype=torch.float16,  # Use FP16 precision
+                use_cache=False,  # Disable KV cache for training
+            )
     except Exception as e:
         print(f"Error loading model: {e}")
         print("Falling back to direct download from HuggingFace")
         tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
-        llama_model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+        llama_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            cache_dir=PROJECTS_DIR,
+            device_map="auto",
+            torch_dtype=torch.float16,  # Use FP16 precision
+            use_cache=False,  # Disable KV cache for training
+        )
+    
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(llama_model, 'gradient_checkpointing_enable'):
+        print("Enabling gradient checkpointing for memory efficiency")
+        llama_model.gradient_checkpointing_enable()
     
     llama_model.to(device)
     llama_model.eval()  # Use the base model in evaluation mode.
@@ -185,7 +209,15 @@ def main():
     diff_model = DiffusionLM(llama_model, num_diffusion_timesteps)
     diff_model.to(device)
 
-    optimizer = optim.Adam(diff_model.parameters(), lr=lr)
+    # Use AdamW with memory optimizations
+    optimizer = optim.AdamW(
+        diff_model.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+        fused=True if torch.__version__ >= "2.0.0" and torch.cuda.is_available() else False  # Use fused Adam if available
+    )
 
     # For demonstration, we create a dummy dataset.
     texts = [
@@ -238,14 +270,22 @@ def main():
             )
 
             loss = mse_loss_fn(predicted_noise, noise)
-            optimizer.zero_grad()
+            # Scale the loss by gradient accumulation steps
+            loss = loss / gradient_accumulation_steps
             loss.backward()
-            optimizer.step()
             
-            epoch_loss += loss.item()
+            # Only update weights after accumulating gradients
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                # Apply gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(diff_model.parameters(), max_grad_norm)
+                
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            epoch_loss += loss.item() * gradient_accumulation_steps  # Scale loss back up for logging
             batch_count += 1
             
-            print(f"  - Batch {batch_idx+1} Loss: {loss.item():.4f}")
+            print(f"  - Batch {batch_idx+1} Loss: {loss.item() * gradient_accumulation_steps:.4f}")
         
         avg_epoch_loss = epoch_loss / max(1, batch_count)
         print(f"Epoch {epoch+1} Complete | Average Loss: {avg_epoch_loss:.4f}")

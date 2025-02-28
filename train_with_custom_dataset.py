@@ -96,6 +96,12 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
     parser.add_argument("--max_examples", type=int, default=None, help="Maximum number of examples to load from dataset")
+    # Add memory optimization parameters
+    parser.add_argument("--fp16", action="store_true", default=False, help="Use mixed precision training (FP16)")
+    parser.add_argument("--bf16", action="store_true", default=False, help="Use mixed precision training (BF16)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Use gradient checkpointing to save memory")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm (for gradient clipping)")
     args = parser.parse_args()
     
     # Hyperparameters from command line
@@ -125,16 +131,38 @@ def main():
         if os.path.exists(cache_model_path):
             print(f"Found cached model at {cache_model_path}, loading from there")
             tokenizer = AutoTokenizer.from_pretrained(cache_model_path)
-            llama_model = AutoModelForCausalLM.from_pretrained(cache_model_path)
+            llama_model = AutoModelForCausalLM.from_pretrained(
+                cache_model_path,
+                device_map="auto" if args.device == "cuda" else None,
+                torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                use_cache=False,  # Disable KV cache for training
+            )
         else:
             print(f"Downloading model from HuggingFace: {model_path}")
             tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
-            llama_model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+            llama_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                cache_dir=PROJECTS_DIR,
+                device_map="auto" if args.device == "cuda" else None,
+                torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                use_cache=False,  # Disable KV cache for training
+            )
     except Exception as e:
         print(f"Error loading model: {e}")
         print("Falling back to direct download from HuggingFace")
         tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
-        llama_model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+        llama_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            cache_dir=PROJECTS_DIR,
+            device_map="auto" if args.device == "cuda" else None,
+            torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+            use_cache=False,  # Disable KV cache for training
+        )
+    
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing and hasattr(llama_model, 'gradient_checkpointing_enable'):
+        print("Enabling gradient checkpointing for memory efficiency")
+        llama_model.gradient_checkpointing_enable()
     
     llama_model.to(device)
     llama_model.eval()  # Use the base model in evaluation mode.
@@ -146,7 +174,22 @@ def main():
     diff_model = DiffusionLM(llama_model, num_diffusion_timesteps)
     diff_model.to(device)
 
-    optimizer = optim.Adam(diff_model.parameters(), lr=lr)
+    # Use AdamW with memory optimizations
+    optimizer = optim.AdamW(
+        diff_model.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+        fused=True if torch.__version__ >= "2.0.0" and torch.cuda.is_available() else False  # Use fused Adam if available
+    )
+
+    # Setup mixed precision training if requested
+    scaler = None
+    if args.fp16 or args.bf16:
+        amp_dtype = torch.float16 if args.fp16 else torch.bfloat16
+        print(f"Using mixed precision training with {str(amp_dtype)} dtype")
+        scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)  # scaler only needed for fp16, not bf16
 
     # Load custom dataset or use dummy data if not provided
     if args.dataset:
@@ -197,23 +240,59 @@ def main():
             # Forward diffusion: x_t = sqrt(alpha_bar_t)*x_0 + sqrt(1-alpha_bar_t)*noise.
             noisy_embeddings = sqrt_alpha * clean_embeddings + sqrt_one_minus_alpha * noise
 
-            # Predict the noise.
-            predicted_noise = diff_model(
-                input_ids=input_ids,
-                timestep=t,
-                noisy_embeddings=noisy_embeddings,
-                attention_mask=attention_mask
-            )
-
-            loss = mse_loss_fn(predicted_noise, noise)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Use mixed precision for forward and backward passes if enabled
+            if args.fp16 or args.bf16:
+                with torch.cuda.amp.autocast(dtype=torch.float16 if args.fp16 else torch.bfloat16):
+                    # Predict the noise.
+                    predicted_noise = diff_model(
+                        input_ids=input_ids,
+                        timestep=t,
+                        noisy_embeddings=noisy_embeddings,
+                        attention_mask=attention_mask
+                    )
+                    loss = mse_loss_fn(predicted_noise, noise)
+                    # Scale the loss by gradient accumulation steps
+                    loss = loss / args.gradient_accumulation_steps
+                
+                if args.fp16:
+                    # Use scaler for fp16
+                    scaler.scale(loss).backward()
+                else:
+                    # bf16 doesn't need scaling
+                    loss.backward()
+            else:
+                # Standard full precision
+                predicted_noise = diff_model(
+                    input_ids=input_ids,
+                    timestep=t,
+                    noisy_embeddings=noisy_embeddings,
+                    attention_mask=attention_mask
+                )
+                loss = mse_loss_fn(predicted_noise, noise)
+                # Scale the loss by gradient accumulation steps
+                loss = loss / args.gradient_accumulation_steps
+                loss.backward()
             
-            epoch_loss += loss.item()
+            # Only update weights after accumulating gradients
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                # Apply gradient clipping to prevent exploding gradients
+                if args.fp16:
+                    scaler.unscale_(optimizer)
+                
+                torch.nn.utils.clip_grad_norm_(diff_model.parameters(), args.max_grad_norm)
+                
+                if args.fp16:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+            
+            epoch_loss += loss.item() * args.gradient_accumulation_steps  # Scale loss back up for logging
             batch_count += 1
             
-            print(f"  - Batch {batch_idx+1} Loss: {loss.item():.4f}")
+            print(f"  - Batch {batch_idx+1} Loss: {loss.item() * args.gradient_accumulation_steps:.4f}")
         
         avg_epoch_loss = epoch_loss / max(1, batch_count)
         print(f"Epoch {epoch+1} Complete | Average Loss: {avg_epoch_loss:.4f}")
