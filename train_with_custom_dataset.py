@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
 A modified version of dlm_train.py that loads a custom dataset from a text file.
-Usage: python train_with_custom_dataset.py --dataset path/to/your/dataset.txt
+
+Usage: 
+    Standard usage:
+    python train_with_custom_dataset.py --dataset path/to/your/dataset.txt
+
+    Low-memory usage example:
+    python train_with_custom_dataset.py \
+        --dataset path/to/your/dataset.txt \
+        --batch_size 1 \
+        --bf16 \
+        --gradient_checkpointing \
+        --gradient_accumulation_steps 8 \
+        --cpu_offload \
+        --offload_layers 2 \
+        --max_length 256
 """
 
 import os
@@ -102,6 +116,9 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of gradient accumulation steps")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Use gradient checkpointing to save memory")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm (for gradient clipping)")
+    parser.add_argument("--cpu_offload", action="store_true", default=False, help="Offload optimizer states and some layers to CPU")
+    parser.add_argument("--offload_layers", type=int, default=2, help="Number of transformer layers to keep on GPU when CPU offloading is enabled")
+    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length for truncation (reduces memory usage)")
     args = parser.parse_args()
     
     # Hyperparameters from command line
@@ -119,6 +136,10 @@ def main():
     betas, sqrt_alpha_bar, sqrt_one_minus_alpha_bar = get_noise_schedule(
         num_diffusion_timesteps, beta_start, beta_end
     )
+    
+    # Move noise schedule to the correct device to avoid issues during indexing
+    sqrt_alpha_bar = sqrt_alpha_bar.to(device)
+    sqrt_one_minus_alpha_bar = sqrt_one_minus_alpha_bar.to(device)
 
     # Define paths to save/load models
     model_path = "qwen/Qwen2.5-3B"  # or your designated identifier/path.
@@ -131,33 +152,113 @@ def main():
         if os.path.exists(cache_model_path):
             print(f"Found cached model at {cache_model_path}, loading from there")
             tokenizer = AutoTokenizer.from_pretrained(cache_model_path)
-            llama_model = AutoModelForCausalLM.from_pretrained(
-                cache_model_path,
-                device_map="auto" if args.device == "cuda" else None,
-                torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
-                use_cache=False,  # Disable KV cache for training
-            )
+            
+            # Configure device map for CPU offloading if requested
+            if args.cpu_offload and args.device == "cuda":
+                print(f"Using CPU offloading. Keeping {args.offload_layers} layers on GPU")
+                device_map = {
+                    "model.embed_tokens": 0,
+                    "model.norm": 0,
+                    "lm_head": 0,
+                }
+                
+                # Assume Qwen model by default
+                layer_prefix = "model.layers."
+                
+                # Keep first few layers on GPU, rest on CPU
+                for i in range(100):
+                    if i < args.offload_layers:
+                        device_map[f"{layer_prefix}{i}"] = 0  # GPU
+                    else:
+                        device_map[f"{layer_prefix}{i}"] = "cpu"  # CPU
+                
+                llama_model = AutoModelForCausalLM.from_pretrained(
+                    cache_model_path,
+                    device_map=device_map,
+                    torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                    use_cache=False,
+                )
+            else:
+                llama_model = AutoModelForCausalLM.from_pretrained(
+                    cache_model_path,
+                    device_map="auto" if args.device == "cuda" else None,
+                    torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                    use_cache=False,
+                )
         else:
             print(f"Downloading model from HuggingFace: {model_path}")
             tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+            
+            # Configure device map for CPU offloading if requested
+            if args.cpu_offload and args.device == "cuda":
+                print(f"Using CPU offloading. Keeping {args.offload_layers} layers on GPU")
+                device_map = {
+                    "model.embed_tokens": 0,
+                    "model.norm": 0,
+                    "lm_head": 0,
+                }
+                
+                layer_prefix = "model.layers."
+                
+                # Keep first few layers on GPU, rest on CPU
+                for i in range(100):
+                    if i < args.offload_layers:
+                        device_map[f"{layer_prefix}{i}"] = 0
+                    else:
+                        device_map[f"{layer_prefix}{i}"] = "cpu"
+                
+                llama_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    cache_dir=PROJECTS_DIR,
+                    device_map=device_map,
+                    torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                    use_cache=False,
+                )
+            else:
+                llama_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    cache_dir=PROJECTS_DIR,
+                    device_map="auto" if args.device == "cuda" else None,
+                    torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                    use_cache=False,
+                )
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Falling back to direct download from HuggingFace")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
+        
+        # Same pattern for the fallback loading
+        if args.cpu_offload and args.device == "cuda":
+            print(f"Using CPU offloading. Keeping {args.offload_layers} layers on GPU")
+            device_map = {
+                "model.embed_tokens": 0,
+                "model.norm": 0, 
+                "lm_head": 0,
+            }
+            
+            layer_prefix = "model.layers."
+            
+            for i in range(100):
+                if i < args.offload_layers:
+                    device_map[f"{layer_prefix}{i}"] = 0
+                else:
+                    device_map[f"{layer_prefix}{i}"] = "cpu"
+            
+            llama_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                cache_dir=PROJECTS_DIR,
+                device_map=device_map,
+                torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
+                use_cache=False,
+            )
+        else:
             llama_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 cache_dir=PROJECTS_DIR,
                 device_map="auto" if args.device == "cuda" else None,
                 torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
-                use_cache=False,  # Disable KV cache for training
+                use_cache=False,
             )
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Falling back to direct download from HuggingFace")
-        tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=PROJECTS_DIR)
-        llama_model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            cache_dir=PROJECTS_DIR,
-            device_map="auto" if args.device == "cuda" else None,
-            torch_dtype=torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32),
-            use_cache=False,  # Disable KV cache for training
-        )
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing and hasattr(llama_model, 'gradient_checkpointing_enable'):
@@ -220,7 +321,13 @@ def main():
             print(f"  Processing batch {batch_idx+1}/{len(dataloader)}")
             
             # Tokenize texts.
-            encoded = tokenizer(batch_texts, return_tensors='pt', padding=True, truncation=True)
+            encoded = tokenizer(
+                batch_texts, 
+                return_tensors='pt', 
+                padding=True, 
+                truncation=True,
+                max_length=args.max_length
+            )
             input_ids = encoded.input_ids.to(device)
             attention_mask = encoded.attention_mask.to(device)
             B, L = input_ids.shape
@@ -233,8 +340,8 @@ def main():
 
             # Sample a diffusion timestep for each batch item.
             t = torch.randint(0, num_diffusion_timesteps, (B,), device=device).long()
-            sqrt_alpha = sqrt_alpha_bar[t].to(device).view(B, 1, 1)
-            sqrt_one_minus_alpha = sqrt_one_minus_alpha_bar[t].to(device).view(B, 1, 1)
+            sqrt_alpha = sqrt_alpha_bar[t].view(B, 1, 1)
+            sqrt_one_minus_alpha = sqrt_one_minus_alpha_bar[t].view(B, 1, 1)
 
             noise = torch.randn_like(clean_embeddings)
             # Forward diffusion: x_t = sqrt(alpha_bar_t)*x_0 + sqrt(1-alpha_bar_t)*noise.

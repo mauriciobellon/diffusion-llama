@@ -153,6 +153,10 @@ def main():
     betas, sqrt_alpha_bar, sqrt_one_minus_alpha_bar = get_noise_schedule(
         num_diffusion_timesteps, beta_start, beta_end
     )
+    
+    # Move noise schedule to the correct device to avoid issues during indexing
+    sqrt_alpha_bar = sqrt_alpha_bar.to(device)
+    sqrt_one_minus_alpha_bar = sqrt_one_minus_alpha_bar.to(device)
 
     # Define paths to save/load models
     model_path = "qwen/Qwen2.5-3B"  # or your designated identifier/path.
@@ -254,8 +258,8 @@ def main():
 
             # Sample a diffusion timestep for each batch item.
             t = torch.randint(0, num_diffusion_timesteps, (B,), device=device).long()
-            sqrt_alpha = sqrt_alpha_bar[t].to(device).view(B, 1, 1)
-            sqrt_one_minus_alpha = sqrt_one_minus_alpha_bar[t].to(device).view(B, 1, 1)
+            sqrt_alpha = sqrt_alpha_bar[t].view(B, 1, 1)
+            sqrt_one_minus_alpha = sqrt_one_minus_alpha_bar[t].view(B, 1, 1)
 
             noise = torch.randn_like(clean_embeddings)
             # Forward diffusion: x_t = sqrt(alpha_bar_t)*x_0 + sqrt(1-alpha_bar_t)*noise.
